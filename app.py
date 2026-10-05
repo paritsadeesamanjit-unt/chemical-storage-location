@@ -7,7 +7,7 @@ import io
 # Page Configuration
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="ระบบวิเคราะห์การรับเข้าสารเคมีและสต๊อก (Chemical Inventory & GR Analytics)",
+    page_title="ระบบวิเคราะห์ประวัติการรับเข้าสารเคมี (Chemical Stock & All Receipts)",
     page_icon="🧪",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -18,11 +18,11 @@ st.set_page_config(
 # ---------------------------------------------------------
 st.markdown("""
 <style>
-    .metric-card {
+    .metric-box {
         background-color: #f8f9fa;
         border-radius: 8px;
-        padding: 15px;
-        border-left: 5px solid #1f77b4;
+        padding: 12px 18px;
+        border-left: 5px solid #28a745;
         box-shadow: 0 1px 3px rgba(0,0,0,0.1);
     }
     .stDataFrame {
@@ -43,14 +43,12 @@ def load_stock_data(uploaded_file):
         dfs = []
         for sheet in excel_obj.sheet_names:
             df_s = pd.read_excel(uploaded_file, sheet_name=sheet)
-            # ตรวจสอบชื่อคอลัมน์มาตรฐาน
             df_s.columns = [str(c).strip() for c in df_s.columns]
             df_s['Source_Sheet'] = sheet
             dfs.append(df_s)
             
         combined_df = pd.concat(dfs, ignore_index=True)
         
-        # จัดการชื่อคอลัมน์ให้อยู่ในมาตรฐานเดียวกัน
         rename_map = {
             'Material': 'Material Num',
             'Material No': 'Material Num',
@@ -81,7 +79,6 @@ def load_movement_data(uploaded_file):
         df = pd.read_excel(uploaded_file)
         df.columns = [str(c).strip() for c in df.columns]
         
-        # ปรับมาตรฐานชื่อคอลัมน์
         rename_map = {
             'Material Num': 'Material',
             'Material Number': 'Material',
@@ -105,7 +102,7 @@ def load_movement_data(uploaded_file):
             if date_col in df.columns:
                 df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
                 
-        # แปลง PO Number ให้แสดงผลเป็นรหัสตัวเลขชัดเจน
+        # ปรับเลข PO ให้เป็นตัวเลขไม่มีทศนิยม
         if 'PO_Number' in df.columns:
             df['PO_Number'] = df['PO_Number'].fillna('-').astype(str).str.replace(r'\.0$', '', regex=True)
             
@@ -115,60 +112,80 @@ def load_movement_data(uploaded_file):
         return None
 
 
-def calculate_analytics(df_stock, df_movement):
-    """คำนวณเชื่อมโยงข้อมูลระหว่างสต๊อกและประวัติการรับเข้า"""
-    # 1. กรองเฉพาะรายการสารเคมีที่มีอยู่ในไฟล์สต๊อกหลัก
+def process_all_receipts_data(df_stock, df_movement):
+    """
+    เชื่อมโยงข้อมูลสต๊อกกับประวัติการรับเข้าทั้งหมด (All Receipts)
+    คืนค่าทั้ง:
+    1. รายการรับเข้าทั้งหมดแบบละเอียด (1 บรรทัดต่อ 1 การรับเข้า)
+    2. สรุปรวมประวัติทุก PO/วันที่ ในบรรทัดเดียว (Grouped by Material)
+    3. ข้อมูลสรุปภาพรวม (Summary)
+    """
     chem_codes = set(df_stock['Material Num'].dropna().unique())
     df_gr_chem = df_movement[df_movement['Material'].isin(chem_codes)].copy()
     
-    # เรียงลำดับตามรหัสและวันที่รับเข้าล่าสุด
     date_col = 'Posting_Date' if 'Posting_Date' in df_gr_chem.columns else 'Document_Date'
-    df_gr_chem.sort_values(by=['Material', date_col, 'Mat_Document'], ascending=[True, True, True], inplace=True)
     
-    # 2. คำนวณค่า Aggregate สรุปรวมต่อรหัสวัสดุ
+    # -------------------------------------------------------------
+    # 1. รายการรับเข้าทั้งหมด (All Transactions: 1 บรรทัดต่อ 1 การรับเข้า)
+    # -------------------------------------------------------------
+    # นำข้อมูล Master Stock ไปผูกเข้ากับ Transaction ทุกรายการ
+    merged_all = pd.merge(
+        df_stock,
+        df_gr_chem,
+        left_on='Material Num',
+        right_on='Material',
+        how='left'
+    )
+    
+    # เรียงลำดับตาม รหัสสารเคมี และ วันที่รับเข้าล่าสุดลงไปหาเก่าสุด
+    merged_all.sort_values(by=['Material Num', date_col, 'Mat_Document'], ascending=[True, False, False], inplace=True)
+    
+    # คำนวณลำดับรอบที่รับเข้า (เช่น รับครั้งที่ 1 จาก 4 ครั้ง)
+    merged_all['Receipt_Seq'] = merged_all.groupby('Material Num').cumcount() + 1
+    total_counts = merged_all.groupby('Material Num')['Receipt_Seq'].transform('count')
+    merged_all['Receipt_Total'] = total_counts
+    merged_all['รอบที่รับ'] = "รอบที่ " + merged_all['Receipt_Seq'].astype(str) + " / " + merged_all['Receipt_Total'].astype(str)
+    
+    # -------------------------------------------------------------
+    # 2. มุมมองจัดกลุ่ม: รวมทุกประวัติรับเข้าไว้ในแถวเดียว (Grouped All History)
+    # -------------------------------------------------------------
+    def format_all_receipts(group):
+        g_sorted = group.sort_values(by=date_col, ascending=False)
+        receipt_items = []
+        for _, r in g_sorted.iterrows():
+            if pd.notna(r[date_col]):
+                d_str = r[date_col].strftime('%Y-%m-%d')
+                po = r.get('PO_Number', '-')
+                qty = r.get('GR_Qty', 0)
+                receipt_items.append(f"• {d_str} | PO: {po} | จำนวน: {qty:,.2f}")
+        return "\n".join(receipt_items) if receipt_items else "ไม่มีข้อมูลรับเข้า"
+
+    grouped_history = df_gr_chem.groupby('Material').apply(format_all_receipts).reset_index(name='ประวัติการรับเข้าทั้งหมด')
+    
+    # คำนวณยอดรวม
     summary_agg = df_gr_chem.groupby('Material').agg(
         Total_GR_Qty=('GR_Qty', 'sum'),
         Receipt_Count=('GR_Qty', 'count'),
-        Latest_GR_Date=(date_col, 'max'),
-        Earliest_GR_Date=(date_col, 'min')
+        Latest_Date=(date_col, 'max')
     ).reset_index()
     
-    # 3. ดึงข้อมูลครั้งล่าสุด (Latest Receipt Detail: PO ล่าสุด, จำนวนล่าสุด, เลขเอกสารล่าสุด)
-    latest_tx = df_gr_chem.groupby('Material').last().reset_index()
-    latest_subset = latest_tx[['Material', 'PO_Number', 'GR_Qty', 'Mat_Document']].copy()
-    latest_subset.columns = ['Material', 'Latest_PO', 'Latest_GR_Qty', 'Latest_Mat_Doc']
+    df_grouped_view = pd.merge(df_stock, summary_agg, left_on='Material Num', right_on='Material', how='left')
+    df_grouped_view = pd.merge(df_grouped_view, grouped_history, left_on='Material Num', right_on='Material', how='left')
+    df_grouped_view.drop(columns=['Material_x', 'Material_y'], inplace=True, errors='ignore')
     
-    # รวมข้อมูลสรุปล่าสุดเข้าด้วยกัน
-    gr_analytics = pd.merge(summary_agg, latest_subset, on='Material', how='left')
-    
-    # 4. นำไป Merge กับ Master Stock Data
-    master_summary = pd.merge(df_stock, gr_analytics, left_on='Material Num', right_on='Material', how='left')
-    master_summary.drop(columns=['Material'], inplace=True, errors='ignore')
-    
-    # จัดการค่า Null สำหรับตัวที่ยังไม่เคยมีการรับเข้า
-    master_summary['Total_GR_Qty'] = master_summary['Total_GR_Qty'].fillna(0)
-    master_summary['Receipt_Count'] = master_summary['Receipt_Count'].fillna(0).astype(int)
-    master_summary['Latest_PO'] = master_summary['Latest_PO'].fillna('-')
-    master_summary['Latest_GR_Qty'] = master_summary['Latest_GR_Qty'].fillna(0)
-    
-    # 5. ตารางประวัติรับเข้าแบบละเอียดทั้งหมด (Detail Transaction)
-    # นำข้อมูลจาก Master Stock เช่น Location และ Stock คงเหลือปัจจุบัน มารวมใน Transaction
-    stock_info = df_stock[['Material Num', 'Material Desc', 'Storage location', 'Unit', 'Unrestricted']].drop_duplicates(subset=['Material Num'])
-    detail_merged = pd.merge(df_gr_chem, stock_info, left_on='Material', right_on='Material Num', how='left')
-    
-    return master_summary, detail_merged, df_gr_chem
+    return merged_all, df_grouped_view, df_gr_chem, date_col
 
 
 def convert_df_to_excel(df):
     """แปลง DataFrame เป็นไฟล์ Excel ในหน่วยความจำเพื่อดาวน์โหลด"""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Data')
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
     return output.getvalue()
 
 
 # ---------------------------------------------------------
-# Sidebar: Upload & Settings
+# Sidebar: Upload & Filters
 # ---------------------------------------------------------
 st.sidebar.title("🧪 ตัวจัดการข้อมูลสารเคมี")
 st.sidebar.markdown("อัปโหลดไฟล์ข้อมูลเพื่อประมวลผล:")
@@ -179,7 +196,6 @@ movement_file = st.sidebar.file_uploader("2. ไฟล์ประวัติ�
 st.sidebar.markdown("---")
 use_sample = st.sidebar.checkbox("📂 ใช้ข้อมูลในระบบอัตโนมัติ (Default Files)", value=(stock_file is None and movement_file is None))
 
-# ตรวจสอบการโหลดไฟล์
 df_stock = None
 df_movement = None
 
@@ -201,216 +217,144 @@ elif use_sample:
 
 
 # ---------------------------------------------------------
-# Main Application Content
+# Main Page Content
 # ---------------------------------------------------------
-st.title("📊 ระบบวิเคราะห์ประวัติการรับเข้าและสต๊อกสารเคมี")
-st.caption("Chemical Inventory & Goods Receipt (PO / Receiving History) Analytics System")
+st.title("📊 รายงานข้อมูลประวัติการรับเข้าสารเคมีทั้งหมด")
+st.caption("แสดงข้อมูลวันที่รับเข้า, เลขที่ PO และจำนวนที่รับเข้าครบทุกรายการ (All Receiving Records)")
 
 if df_stock is None or df_movement is None:
-    st.info("👋 กรุณาอัปโหลดไฟล์ **1. ไฟล์สต๊อกสารเคมีปัจจุบัน** และ **2. ไฟล์การเคลื่อนไหวรับเข้า (EXPORT)** ทางแถบเมนูด้านซ้ายเพื่อเริ่มการวิเคราะห์")
+    st.info("👋 กรุณาอัปโหลดไฟล์สต๊อกและไฟล์การเคลื่อนไหวทางแถบเมนูด้านซ้ายเพื่อเริ่มประมวลผล")
     st.stop()
 
 # ประมวลผลข้อมูล
-master_summary, detail_merged, df_gr_chem = calculate_analytics(df_stock, df_movement)
+merged_all, df_grouped_view, df_gr_chem, date_col = process_all_receipts_data(df_stock, df_movement)
 
-# KPI Cards
-total_items = len(master_summary)
-total_current_stock = master_summary['Unrestricted'].sum()
-total_received_qty = master_summary['Total_GR_Qty'].sum()
-total_gr_records = len(df_gr_chem)
-unique_pos = df_gr_chem['PO_Number'].nunique() if 'PO_Number' in df_gr_chem.columns else 0
-
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("จำนวนสารเคมีทั้งหมด", f"{total_items:,} รายการ")
-col2.metric("ยอดสต๊อกคงเหลือรวม", f"{total_current_stock:,.2f}")
-col3.metric("ยอดรับเข้าสะสมทั้งหมด", f"{total_received_qty:,.2f}")
-col4.metric("ครั้งที่รับเข้าทั้งหมด", f"{total_gr_records:,} ครั้ง")
-col5.metric("จำนวน PO ทั้งหมด", f"{unique_pos:,} ใบ")
+# สรุปตัวเลขสถิติภาพรวมด้านบน
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("จำนวนสารเคมีในสต๊อก", f"{len(df_stock):,} รายการ")
+c2.metric("ยอดสต๊อกคงเหลือรวม", f"{df_stock['Unrestricted'].sum():,.2f}")
+c3.metric("จำนวนครั้งที่รับเข้าทั้งหมด", f"{len(df_gr_chem):,} ครั้ง")
+c4.metric("ยอดรับเข้ารวมทั้งหมด", f"{df_gr_chem['GR_Qty'].sum():,.2f}")
 
 st.markdown("---")
 
-# Navigation Tabs
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📋 สรุปสต๊อก & การรับเข้าล่าสุด (Summary)",
-    "📑 ประวัติการรับเข้าทั้งหมด (All Receipts Detail)",
-    "🔍 เจาะลึกรายสารเคมี (Item Drilldown)",
-    "📦 วิเคราะห์ตามใบสั่งซื้อ (PO Analysis)"
-])
+# ---------------------------------------------------------
+# ส่วนเลือกมุมมองการแสดงผล (Display Modes)
+# ---------------------------------------------------------
+st.subheader("📑 ตารางข้อมูลการรับเข้าสารเคมี")
+
+view_mode = st.radio(
+    "เลือกรูปแบบการแสดงข้อมูล:",
+    [
+        "1. แสดงประวัติการรับเข้าทุกรายการ (1 บรรทัดต่อ 1 การรับเข้า - รายละเอียดครบทุก PO และวันที่)",
+        "2. แสดงประวัติรวมทุกการรับเข้าในแถวเดียว (1 บรรทัดต่อ 1 สารเคมี รวมประวัติ PO ทั้งหมด)"
+    ],
+    horizontal=True
+)
+
+# กล่องค้นหาและตัวกรองข้อมูล
+f1, f2, f3 = st.columns([1.2, 1.5, 1.3])
+with f1:
+    loc_options = ["ทั้งหมด"] + sorted(list(df_stock['Storage location'].dropna().unique()))
+    selected_loc = st.selectbox("กรองตามสถานที่จัดเก็บ:", loc_options)
+with f2:
+    search_kw = st.text_input("ค้นหารหัสสารเคมี / ชื่อสารเคมี:", placeholder="เช่น T11-, BO-7790...")
+with f3:
+    po_search = st.text_input("ค้นหาเลขที่ PO:", placeholder="เช่น 6700195641...")
 
 # ---------------------------------------------------------
-# TAB 1: สรุปภาพรวมและข้อมูลการรับเข้าล่าสุด (1 แถวต่อ 1 สารเคมี)
+# รูปแบบที่ 1: รายการรับเข้าทั้งหมด (All Transactions)
 # ---------------------------------------------------------
-with tab1:
-    st.subheader("📋 ภาพรวมสต๊อกสารเคมีและข้อมูลการรับเข้าล่าสุด")
-    st.markdown("ตารางนี้เชื่อมโยงสารเคมีทุกตัวกับยอดรับรวมสะสม พร้อม **วันที่รับเข้าล่าสุด**, **เลขที่ PO ล่าสุด** และ **จำนวนที่รับเข้าล่าสุด**")
+if "1. แสดงประวัติการรับเข้าทุกรายการ" in view_mode:
+    filtered_df = merged_all.copy()
     
-    # ตัวกรองข้อมูล
-    f_col1, f_col2 = st.columns([1, 2])
-    with f_col1:
-        loc_options = ["ทั้งหมด"] + sorted(list(master_summary['Storage location'].dropna().unique()))
-        selected_loc = st.selectbox("กรองตามพื้นที่จัดเก็บ (Storage Location):", loc_options)
-    with f_col2:
-        search_kw = st.text_input("ค้นหารหัสหรือชื่อสารเคมี:", placeholder="พิมพ์รหัส เช่น T12- หรือชื่อสารเคมี...")
-
-    filtered_summary = master_summary.copy()
     if selected_loc != "ทั้งหมด":
-        filtered_summary = filtered_summary[filtered_summary['Storage location'] == selected_loc]
+        filtered_df = filtered_df[filtered_df['Storage location'] == selected_loc]
     if search_kw:
-        filtered_summary = filtered_summary[
-            filtered_summary['Material Num'].str.contains(search_kw, case=False, na=False) |
-            filtered_summary['Material Desc'].str.contains(search_kw, case=False, na=False)
+        filtered_df = filtered_df[
+            filtered_df['Material Num'].str.contains(search_kw, case=False, na=False) |
+            filtered_df['Material Desc'].str.contains(search_kw, case=False, na=False)
         ]
+    if po_search:
+        filtered_df = filtered_df[filtered_df['PO_Number'].str.contains(po_search, na=False)]
 
-    # เตรียมตารางแสดงผลสวยงาม
+    # จัดเตรียมคอลัมน์แสดงผล
     display_cols = [
-        'Material Num', 'Material Desc', 'Storage location', 'Unit', 
-        'Unrestricted', 'Total_GR_Qty', 'Receipt_Count', 
-        'Latest_GR_Date', 'Latest_PO', 'Latest_GR_Qty'
+        'Material Num', 'Material Desc', 'Storage location', 'Unrestricted', 'Unit',
+        'รอบที่รับ', date_col, 'PO_Number', 'GR_Qty', 'Mat_Document', 'Batch', 'Vendor'
     ]
+    actual_cols = [c for c in display_cols if c in filtered_df.columns]
     
-    # แปลง Format วันที่ให้ดูง่าย
-    display_df = filtered_summary[display_cols].copy()
-    display_df['Latest_GR_Date'] = display_df['Latest_GR_Date'].dt.strftime('%Y-%m-%d').fillna('-')
-    display_df.rename(columns={
-        'Material Num': 'รหัสสารเคมี (Material)',
-        'Material Desc': 'ชื่อสารเคมี (Description)',
+    show_df = filtered_df[actual_cols].copy()
+    if date_col in show_df.columns:
+        show_df[date_col] = show_df[date_col].dt.strftime('%Y-%m-%d').fillna('-')
+        
+    show_df.rename(columns={
+        'Material Num': 'รหัสสารเคมี',
+        'Material Desc': 'ชื่อสารเคมี',
+        'Storage location': 'สถานที่จัดเก็บ',
+        'Unrestricted': 'สต๊อกคงเหลือปัจจุบัน',
+        'Unit': 'หน่วย',
+        'รอบที่รับ': 'รอบที่รับ',
+        date_col: 'วันที่รับเข้า',
+        'PO_Number': 'เลขที่ PO',
+        'GR_Qty': 'จำนวนที่รับเข้า',
+        'Mat_Document': 'เลขที่เอกสารรับ (Mat Doc)',
+        'Batch': 'ล็อต (Batch)',
+        'Vendor': 'รหัสผู้ขาย (Vendor)'
+    }, inplace=True)
+
+    st.markdown(f"**แสดงผลทั้งหมด: `{len(show_df):,}` รายการรับเข้า** (เรียงลำดับจากวันที่รับล่าสุดไปหาเก่าสุด)")
+    st.dataframe(show_df, use_container_width=True, height=520)
+
+    # ปุ่มดาวน์โหลด Excel
+    excel_data = convert_df_to_excel(show_df)
+    st.download_button(
+        label="📥 ดาวน์โหลดประวัติการรับเข้าทั้งหมดเป็น Excel",
+        data=excel_data,
+        file_name="Chemical_All_Goods_Receipts.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+# ---------------------------------------------------------
+# รูปแบบที่ 2: สรุปใน 1 แถวต่อสารเคมี (Grouped All Receipts in One Row)
+# ---------------------------------------------------------
+else:
+    filtered_grouped = df_grouped_view.copy()
+    
+    if selected_loc != "ทั้งหมด":
+        filtered_grouped = filtered_grouped[filtered_grouped['Storage location'] == selected_loc]
+    if search_kw:
+        filtered_grouped = filtered_grouped[
+            filtered_grouped['Material Num'].str.contains(search_kw, case=False, na=False) |
+            filtered_grouped['Material Desc'].str.contains(search_kw, case=False, na=False)
+        ]
+    if po_search:
+        filtered_grouped = filtered_grouped[filtered_grouped['ประวัติการรับเข้าทั้งหมด'].str.contains(po_search, na=False)]
+
+    disp_grouped = filtered_grouped[[
+        'Material Num', 'Material Desc', 'Storage location', 'Unit', 
+        'Unrestricted', 'Total_GR_Qty', 'Receipt_Count', 'ประวัติการรับเข้าทั้งหมด'
+    ]].copy()
+    
+    disp_grouped.rename(columns={
+        'Material Num': 'รหัสสารเคมี',
+        'Material Desc': 'ชื่อสารเคมี',
         'Storage location': 'สถานที่จัดเก็บ',
         'Unit': 'หน่วย',
         'Unrestricted': 'สต๊อกปัจจุบัน',
         'Total_GR_Qty': 'ยอดรับสะสมรวม',
         'Receipt_Count': 'จำนวนครั้งที่รับ',
-        'Latest_GR_Date': 'วันที่รับล่าสุด',
-        'Latest_PO': 'PO ล่าสุด',
-        'Latest_GR_Qty': 'จำนวนที่รับล่าสุด'
+        'ประวัติการรับเข้าทั้งหมด': 'ประวัติการรับเข้าทั้งหมด (วันที่ | PO | จำนวน)'
     }, inplace=True)
 
-    st.dataframe(display_df, use_container_width=True, height=450)
-    
-    # ปุ่มดาวน์โหลด Excel
-    excel_summary = convert_df_to_excel(display_df)
+    st.markdown(f"**แสดงผลทั้งหมด: `{len(disp_grouped):,}` ชนิดสารเคมี**")
+    st.dataframe(disp_grouped, use_container_width=True, height=520)
+
+    excel_grouped = convert_df_to_excel(disp_grouped)
     st.download_button(
         label="📥 ดาวน์โหลดตารางสรุปเป็น Excel",
-        data=excel_summary,
-        file_name="Chemical_Stock_and_Latest_GR_Summary.xlsx",
+        data=excel_grouped,
+        file_name="Chemical_Grouped_All_Receipts.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
-# ---------------------------------------------------------
-# TAB 2: ประวัติการรับเข้าทั้งหมด (All Transaction Details)
-# ---------------------------------------------------------
-with tab2:
-    st.subheader("📑 ประวัติการรับเข้าสารเคมีทุกรายการ (Goods Receipt Transactions)")
-    st.markdown("แสดงรายการการรับเข้าแยกตามแต่ละครั้ง (1 Material มีหลายการรับเข้า) พร้อมเลขที่ PO และจำนวนที่รับ")
-
-    # ตัวกรองในแท็บ 2
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        po_filter = st.text_input("ค้นหาเลขที่ PO:", placeholder="เช่น 6700195641...")
-    with c2:
-        mat_filter = st.text_input("ค้นหารหัสสารเคมี:", placeholder="เช่น T11-90240202...", key="t2_mat")
-    with c3:
-        if 'Posting_Date' in detail_merged.columns and not detail_merged['Posting_Date'].isna().all():
-            min_date = detail_merged['Posting_Date'].min().date()
-            max_date = detail_merged['Posting_Date'].max().date()
-            date_range = st.date_input("ช่วงวันที่รับเข้า (Posting Date):", [min_date, max_date])
-        else:
-            date_range = None
-
-    filtered_detail = detail_merged.copy()
-    if po_filter:
-        filtered_detail = filtered_detail[filtered_detail['PO_Number'].str.contains(po_filter, na=False)]
-    if mat_filter:
-        filtered_detail = filtered_detail[
-            filtered_detail['Material'].str.contains(mat_filter, case=False, na=False) |
-            filtered_detail['Material Desc'].str.contains(mat_filter, case=False, na=False)
-        ]
-    if date_range and len(date_range) == 2:
-        start_d, end_d = date_range
-        filtered_detail = filtered_detail[
-            (filtered_detail['Posting_Date'].dt.date >= start_d) & 
-            (filtered_detail['Posting_Date'].dt.date <= end_d)
-        ]
-
-    # เลือกคอลัมน์สำคัญมาแสดงผล
-    show_cols = [
-        'Posting_Date', 'Purchase order' if 'Purchase order' in filtered_detail.columns else 'PO_Number',
-        'Material', 'Material Desc', 'GR_Qty', 'Unit of Entry', 'Storage location', 
-        'Mat_Document', 'Batch', 'Vendor'
-    ]
-    actual_cols = [c for c in show_cols if c in filtered_detail.columns]
-    
-    st.markdown(f"**พบข้อมูลทั้งหมด: {len(filtered_detail):,} รายการ**")
-    st.dataframe(filtered_detail[actual_cols].sort_values(by='Posting_Date', ascending=False), use_container_width=True, height=450)
-
-    excel_detail = convert_df_to_excel(filtered_detail[actual_cols])
-    st.download_button(
-        label="📥 ดาวน์โหลดประวัติการรับเข้าทั้งหมดเป็น Excel",
-        data=excel_detail,
-        file_name="Chemical_All_GR_History.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-# ---------------------------------------------------------
-# TAB 3: เจาะลึกรายสารเคมี (Item Drilldown & Receiving Timeline)
-# ---------------------------------------------------------
-with tab3:
-    st.subheader("🔍 เจาะลึกข้อมูลและประวัติการรับเข้าของสารเคมีรายตัว")
-    
-    chem_list = sorted(master_summary['Material Num'].unique())
-    selected_chem = st.selectbox(
-        "เลือกรหัสสารเคมีที่ต้องการตรวจสอบ:", 
-        chem_list,
-        format_func=lambda x: f"{x} - {master_summary[master_summary['Material Num'] == x]['Material Desc'].values[0]}"
-    )
-    
-    chem_info = master_summary[master_summary['Material Num'] == selected_chem].iloc[0]
-    chem_history = detail_merged[detail_merged['Material'] == selected_chem].sort_values(by='Posting_Date', ascending=False)
-    
-    # การ์ดแสดงข้อมูลสรุปของสารตัวที่เลือก
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("สต๊อกปัจจุบัน", f"{chem_info['Unrestricted']:,.2f} {chem_info['Unit']}")
-    m2.metric("ยอดรับเข้ารวมทั้งหมด", f"{chem_info['Total_GR_Qty']:,.2f} {chem_info['Unit']}")
-    m3.metric("จำนวนรอบที่รับเข้า", f"{len(chem_history)} ครั้ง")
-    m4.metric("รับเข้าล่าสุด", str(chem_info['Latest_GR_Date'])[:10] if pd.notna(chem_info['Latest_GR_Date']) else "-")
-
-    st.markdown("#### ประวัติการรับเข้าสารเคมีรายการนี้แยกตาม PO และวันที่")
-    if not chem_history.empty:
-        # แสดงตารางประวัติของสารเคมีตัวนี้
-        sub_cols = ['Posting_Date', 'PO_Number', 'GR_Qty', 'Unit of Entry', 'Mat_Document', 'Batch', 'Vendor']
-        valid_sub = [c for c in sub_cols if c in chem_history.columns]
-        st.dataframe(chem_history[valid_sub], use_container_width=True)
-        
-        # กราฟแท่งแสดงแนวโน้มจำนวนที่รับเข้าในแต่ละวันที่
-        chart_data = chem_history.groupby('Posting_Date')['GR_Qty'].sum().reset_index()
-        chart_data.sort_values(by='Posting_Date', inplace=True)
-        chart_data.set_index('Posting_Date', inplace=True)
-        st.markdown("##### กราฟแสดงจำนวนที่รับเข้าในแต่ละช่วงเวลา:")
-        st.bar_chart(chart_data)
-    else:
-        st.warning("ไม่พบประวัติการรับเข้าสำหรับสารเคมีรายการนี้")
-
-# ---------------------------------------------------------
-# TAB 4: วิเคราะห์ตามใบสั่งซื้อ (PO Analysis)
-# ---------------------------------------------------------
-with tab4:
-    st.subheader("📦 สรุปการรับเข้าสารเคมีจัดกลุ่มตามเลขที่ใบสั่งซื้อ (PO Analysis)")
-    
-    po_summary = df_gr_chem.groupby('PO_Number').agg(
-        Total_Qty=('GR_Qty', 'sum'),
-        Item_Count=('Material', 'nunique'),
-        Receipt_Records=('GR_Qty', 'count'),
-        Latest_Date=('Posting_Date', 'max'),
-        Vendor=('Vendor', lambda x: x.iloc[0] if len(x) > 0 else '-')
-    ).reset_index().sort_values(by='Latest_Date', ascending=False)
-    
-    po_summary['Latest_Date'] = po_summary['Latest_Date'].dt.strftime('%Y-%m-%d')
-    po_summary.rename(columns={
-        'PO_Number': 'เลขที่ PO',
-        'Total_Qty': 'จำนวนรับรวม',
-        'Item_Count': 'จำนวนชนิดสารเคมี',
-        'Receipt_Records': 'จำนวนรายการรับ',
-        'Latest_Date': 'วันที่รับเข้าล่าสุด',
-        'Vendor': 'รหัสผู้ขาย (Vendor)'
-    }, inplace=True)
-    
-    st.dataframe(po_summary, use_container_width=True, height=450)
