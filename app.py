@@ -66,6 +66,11 @@ def load_stock_data(uploaded_file):
         if 'Unrestricted' in combined_df.columns:
             combined_df['Unrestricted'] = pd.to_numeric(combined_df['Unrestricted'], errors='coerce').fillna(0)
             
+        if 'Storage location' not in combined_df.columns:
+            combined_df['Storage location'] = combined_df['Source_Sheet']
+        else:
+            combined_df['Storage location'] = combined_df['Storage location'].fillna(combined_df['Source_Sheet'])
+            
         return combined_df
     except Exception as e:
         st.error(f"เกิดข้อผิดพลาดในการโหลดไฟล์สต๊อก: {e}")
@@ -79,6 +84,7 @@ def load_movement_data(uploaded_file):
         df = pd.read_excel(uploaded_file)
         df.columns = [str(c).strip() for c in df.columns]
         
+        # ปรับชื่อคอลัมน์ให้ตรงกัน และแยกชื่อ Storage location ไม่ให้ชนกับไฟล์สต๊อก
         rename_map = {
             'Material Num': 'Material',
             'Material Number': 'Material',
@@ -87,7 +93,9 @@ def load_movement_data(uploaded_file):
             'Posting Date': 'Posting_Date',
             'Document Date': 'Document_Date',
             'Purchase order': 'PO_Number',
-            'Material Document': 'Mat_Document'
+            'Material Document': 'Mat_Document',
+            'Storage location': 'GR_Storage_Location',
+            'Storage Location': 'GR_Storage_Location'
         }
         df.rename(columns=rename_map, inplace=True)
         
@@ -115,10 +123,6 @@ def load_movement_data(uploaded_file):
 def process_all_receipts_data(df_stock, df_movement):
     """
     เชื่อมโยงข้อมูลสต๊อกกับประวัติการรับเข้าทั้งหมด (All Receipts)
-    คืนค่าทั้ง:
-    1. รายการรับเข้าทั้งหมดแบบละเอียด (1 บรรทัดต่อ 1 การรับเข้า)
-    2. สรุปรวมประวัติทุก PO/วันที่ ในบรรทัดเดียว (Grouped by Material)
-    3. ข้อมูลสรุปภาพรวม (Summary)
     """
     chem_codes = set(df_stock['Material Num'].dropna().unique())
     df_gr_chem = df_movement[df_movement['Material'].isin(chem_codes)].copy()
@@ -128,13 +132,13 @@ def process_all_receipts_data(df_stock, df_movement):
     # -------------------------------------------------------------
     # 1. รายการรับเข้าทั้งหมด (All Transactions: 1 บรรทัดต่อ 1 การรับเข้า)
     # -------------------------------------------------------------
-    # นำข้อมูล Master Stock ไปผูกเข้ากับ Transaction ทุกรายการ
     merged_all = pd.merge(
         df_stock,
         df_gr_chem,
         left_on='Material Num',
         right_on='Material',
-        how='left'
+        how='left',
+        suffixes=('', '_gr')  # ป้องกันไม่ให้คอลัมน์ของ df_stock ถูกเติม _x
     )
     
     # เรียงลำดับตาม รหัสสารเคมี และ วันที่รับเข้าล่าสุดลงไปหาเก่าสุด
@@ -169,9 +173,9 @@ def process_all_receipts_data(df_stock, df_movement):
         Latest_Date=(date_col, 'max')
     ).reset_index()
     
-    df_grouped_view = pd.merge(df_stock, summary_agg, left_on='Material Num', right_on='Material', how='left')
-    df_grouped_view = pd.merge(df_grouped_view, grouped_history, left_on='Material Num', right_on='Material', how='left')
-    df_grouped_view.drop(columns=['Material_x', 'Material_y'], inplace=True, errors='ignore')
+    df_grouped_view = pd.merge(df_stock, summary_agg, left_on='Material Num', right_on='Material', how='left', suffixes=('', '_sum'))
+    df_grouped_view = pd.merge(df_grouped_view, grouped_history, left_on='Material Num', right_on='Material', how='left', suffixes=('', '_hist'))
+    df_grouped_view.drop(columns=['Material_sum', 'Material_hist', 'Material'], inplace=True, errors='ignore')
     
     return merged_all, df_grouped_view, df_gr_chem, date_col
 
@@ -185,7 +189,7 @@ def convert_df_to_excel(df):
 
 
 # ---------------------------------------------------------
-# Sidebar: Upload & Filters
+# Sidebar: Upload & Settings
 # ---------------------------------------------------------
 st.sidebar.title("🧪 ตัวจัดการข้อมูลสารเคมี")
 st.sidebar.markdown("อัปโหลดไฟล์ข้อมูลเพื่อประมวลผล:")
@@ -220,7 +224,7 @@ elif use_sample:
 # Main Page Content
 # ---------------------------------------------------------
 st.title("📊 รายงานข้อมูลประวัติการรับเข้าสารเคมีทั้งหมด")
-st.caption("แสดงข้อมูลวันที่รับเข้า, เลขที่ PO และจำนวนที่รับเข้าครบทุกรายการ (All Receiving Records)")
+st.caption("Chemical Inventory & All Receiving Transactions (PO / Receipt History)")
 
 if df_stock is None or df_movement is None:
     st.info("👋 กรุณาอัปโหลดไฟล์สต๊อกและไฟล์การเคลื่อนไหวทางแถบเมนูด้านซ้ายเพื่อเริ่มประมวลผล")
@@ -268,7 +272,7 @@ with f3:
 if "1. แสดงประวัติการรับเข้าทุกรายการ" in view_mode:
     filtered_df = merged_all.copy()
     
-    if selected_loc != "ทั้งหมด":
+    if selected_loc != "ทั้งหมด" and 'Storage location' in filtered_df.columns:
         filtered_df = filtered_df[filtered_df['Storage location'] == selected_loc]
     if search_kw:
         filtered_df = filtered_df[
@@ -322,7 +326,7 @@ if "1. แสดงประวัติการรับเข้าทุก�
 else:
     filtered_grouped = df_grouped_view.copy()
     
-    if selected_loc != "ทั้งหมด":
+    if selected_loc != "ทั้งหมด" and 'Storage location' in filtered_grouped.columns:
         filtered_grouped = filtered_grouped[filtered_grouped['Storage location'] == selected_loc]
     if search_kw:
         filtered_grouped = filtered_grouped[
