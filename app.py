@@ -7,7 +7,7 @@ import io
 # Page Configuration
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="ระบบวิเคราะห์ประวัติการรับเข้าสารเคมี (Chemical Stock & All Receipts)",
+    page_title="ระบบวิเคราะห์ประวัติการรับเข้าและสต๊อกสารเคมี",
     page_icon="🧪",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -18,13 +18,6 @@ st.set_page_config(
 # ---------------------------------------------------------
 st.markdown("""
 <style>
-    .metric-box {
-        background-color: #f8f9fa;
-        border-radius: 8px;
-        padding: 12px 18px;
-        border-left: 5px solid #28a745;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-    }
     .stDataFrame {
         border-radius: 8px;
         overflow: hidden;
@@ -33,18 +26,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# Helper Functions: Data Processing
+# Data Loading Functions
 # ---------------------------------------------------------
 @st.cache_data
 def load_stock_data(uploaded_file):
-    """โหลดข้อมูลไฟล์สต๊อกหลัก อ่านทุก Sheet อัตโนมัติ"""
+    """โหลดข้อมูลไฟล์สต๊อกหลัก อ่านทุก Sheet อัตโนมัติ (Chemical B2, A3, B3)"""
     try:
         excel_obj = pd.ExcelFile(uploaded_file)
         dfs = []
         for sheet in excel_obj.sheet_names:
             df_s = pd.read_excel(uploaded_file, sheet_name=sheet)
             df_s.columns = [str(c).strip() for c in df_s.columns]
-            df_s['Source_Sheet'] = sheet
+            df_s['Sheet_Name'] = sheet
             dfs.append(df_s)
             
         combined_df = pd.concat(dfs, ignore_index=True)
@@ -67,9 +60,9 @@ def load_stock_data(uploaded_file):
             combined_df['Unrestricted'] = pd.to_numeric(combined_df['Unrestricted'], errors='coerce').fillna(0)
             
         if 'Storage location' not in combined_df.columns:
-            combined_df['Storage location'] = combined_df['Source_Sheet']
+            combined_df['Storage location'] = combined_df['Sheet_Name']
         else:
-            combined_df['Storage location'] = combined_df['Storage location'].fillna(combined_df['Source_Sheet'])
+            combined_df['Storage location'] = combined_df['Storage location'].fillna(combined_df['Sheet_Name'])
             
         return combined_df
     except Exception as e:
@@ -79,12 +72,12 @@ def load_stock_data(uploaded_file):
 
 @st.cache_data
 def load_movement_data(uploaded_file):
-    """โหลดข้อมูลไฟล์การเคลื่อนไหวรับเข้า (Goods Receipt)"""
+    """โหลดข้อมูลไฟล์ประวัติการรับเข้า (Goods Receipt Transactions)"""
     try:
         df = pd.read_excel(uploaded_file)
         df.columns = [str(c).strip() for c in df.columns]
         
-        # ปรับชื่อคอลัมน์ให้ตรงกัน และแยกชื่อ Storage location ไม่ให้ชนกับไฟล์สต๊อก
+        # เปลี่ยนชื่อเพื่อป้องกันไม่ให้ชนกับคอลัมน์ของไฟล์สต๊อก
         rename_map = {
             'Material Num': 'Material',
             'Material Number': 'Material',
@@ -110,7 +103,7 @@ def load_movement_data(uploaded_file):
             if date_col in df.columns:
                 df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
                 
-        # ปรับเลข PO ให้เป็นตัวเลขไม่มีทศนิยม
+        # ปรับเลข PO ให้แสดงเป็นตัวเลขจำนวนเต็ม
         if 'PO_Number' in df.columns:
             df['PO_Number'] = df['PO_Number'].fillna('-').astype(str).str.replace(r'\.0$', '', regex=True)
             
@@ -121,38 +114,32 @@ def load_movement_data(uploaded_file):
 
 
 def process_all_receipts_data(df_stock, df_movement):
-    """
-    เชื่อมโยงข้อมูลสต๊อกกับประวัติการรับเข้าทั้งหมด (All Receipts)
-    """
+    """ประมวลผลเชื่อมโยงสต๊อกและประวัติการรับเข้าทั้งหมด"""
     chem_codes = set(df_stock['Material Num'].dropna().unique())
     df_gr_chem = df_movement[df_movement['Material'].isin(chem_codes)].copy()
     
     date_col = 'Posting_Date' if 'Posting_Date' in df_gr_chem.columns else 'Document_Date'
     
-    # -------------------------------------------------------------
-    # 1. รายการรับเข้าทั้งหมด (All Transactions: 1 บรรทัดต่อ 1 การรับเข้า)
-    # -------------------------------------------------------------
+    # 1. รายการรับเข้าทั้งหมด (1 บรรทัดต่อ 1 รอบการรับเข้า)
     merged_all = pd.merge(
         df_stock,
         df_gr_chem,
         left_on='Material Num',
         right_on='Material',
         how='left',
-        suffixes=('', '_gr')  # ป้องกันไม่ให้คอลัมน์ของ df_stock ถูกเติม _x
+        suffixes=('', '_gr')
     )
     
-    # เรียงลำดับตาม รหัสสารเคมี และ วันที่รับเข้าล่าสุดลงไปหาเก่าสุด
+    # เรียงลำดับตามรหัสสารเคมี และวันที่รับเข้าล่าสุดไปหาเก่าสุด
     merged_all.sort_values(by=['Material Num', date_col, 'Mat_Document'], ascending=[True, False, False], inplace=True)
     
-    # คำนวณลำดับรอบที่รับเข้า (เช่น รับครั้งที่ 1 จาก 4 ครั้ง)
+    # ลำดับรอบการรับเข้า (เช่น รอบที่ 1 / 4)
     merged_all['Receipt_Seq'] = merged_all.groupby('Material Num').cumcount() + 1
     total_counts = merged_all.groupby('Material Num')['Receipt_Seq'].transform('count')
     merged_all['Receipt_Total'] = total_counts
     merged_all['รอบที่รับ'] = "รอบที่ " + merged_all['Receipt_Seq'].astype(str) + " / " + merged_all['Receipt_Total'].astype(str)
     
-    # -------------------------------------------------------------
-    # 2. มุมมองจัดกลุ่ม: รวมทุกประวัติรับเข้าไว้ในแถวเดียว (Grouped All History)
-    # -------------------------------------------------------------
+    # 2. รวมประวัติการรับเข้าทั้งหมดไว้ในแถวเดียว (Grouped View)
     def format_all_receipts(group):
         g_sorted = group.sort_values(by=date_col, ascending=False)
         receipt_items = []
@@ -166,7 +153,6 @@ def process_all_receipts_data(df_stock, df_movement):
 
     grouped_history = df_gr_chem.groupby('Material').apply(format_all_receipts).reset_index(name='ประวัติการรับเข้าทั้งหมด')
     
-    # คำนวณยอดรวม
     summary_agg = df_gr_chem.groupby('Material').agg(
         Total_GR_Qty=('GR_Qty', 'sum'),
         Receipt_Count=('GR_Qty', 'count'),
@@ -181,15 +167,15 @@ def process_all_receipts_data(df_stock, df_movement):
 
 
 def convert_df_to_excel(df):
-    """แปลง DataFrame เป็นไฟล์ Excel ในหน่วยความจำเพื่อดาวน์โหลด"""
+    """ส่งออกเป็นไฟล์ Excel เพื่อดาวน์โหลด"""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Sheet1')
+        df.to_excel(writer, index=False, sheet_name='Data')
     return output.getvalue()
 
 
 # ---------------------------------------------------------
-# Sidebar: Upload & Settings
+# Sidebar
 # ---------------------------------------------------------
 st.sidebar.title("🧪 ตัวจัดการข้อมูลสารเคมี")
 st.sidebar.markdown("อัปโหลดไฟล์ข้อมูลเพื่อประมวลผล:")
@@ -221,19 +207,19 @@ elif use_sample:
 
 
 # ---------------------------------------------------------
-# Main Page Content
+# Main Page
 # ---------------------------------------------------------
 st.title("📊 รายงานข้อมูลประวัติการรับเข้าสารเคมีทั้งหมด")
-st.caption("Chemical Inventory & All Receiving Transactions (PO / Receipt History)")
+st.caption("แสดงวันที่รับเข้า, เลขที่ PO และจำนวนที่รับเข้าครบทุกรายการ (All Goods Receipts)")
 
 if df_stock is None or df_movement is None:
-    st.info("👋 กรุณาอัปโหลดไฟล์สต๊อกและไฟล์การเคลื่อนไหวทางแถบเมนูด้านซ้ายเพื่อเริ่มประมวลผล")
+    st.info("👋 กรุณาอัปโหลดไฟล์สต๊อกและไฟล์การเคลื่อนไหวทางแถบเมนูด้านซ้ายเพื่อเริ่มการวิเคราะห์")
     st.stop()
 
 # ประมวลผลข้อมูล
 merged_all, df_grouped_view, df_gr_chem, date_col = process_all_receipts_data(df_stock, df_movement)
 
-# สรุปตัวเลขสถิติภาพรวมด้านบน
+# สรุปภาพรวม
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("จำนวนสารเคมีในสต๊อก", f"{len(df_stock):,} รายการ")
 c2.metric("ยอดสต๊อกคงเหลือรวม", f"{df_stock['Unrestricted'].sum():,.2f}")
@@ -243,7 +229,7 @@ c4.metric("ยอดรับเข้ารวมทั้งหมด", f"{df_
 st.markdown("---")
 
 # ---------------------------------------------------------
-# ส่วนเลือกมุมมองการแสดงผล (Display Modes)
+# ตัวเลือกรูปแบบการแสดงผล
 # ---------------------------------------------------------
 st.subheader("📑 ตารางข้อมูลการรับเข้าสารเคมี")
 
@@ -256,15 +242,23 @@ view_mode = st.radio(
     horizontal=True
 )
 
-# กล่องค้นหาและตัวกรองข้อมูล
-f1, f2, f3 = st.columns([1.2, 1.5, 1.3])
+# ตัวกรองข้อมูล
+f1, f2, f3, f4 = st.columns([1.2, 1.2, 1.3, 1.3])
 with f1:
-    loc_options = ["ทั้งหมด"] + sorted(list(df_stock['Storage location'].dropna().unique()))
-    selected_loc = st.selectbox("กรองตามสถานที่จัดเก็บ:", loc_options)
+    # กรองตามแผ่นงาน (Chemical B2, Chemical A3, Chemical B3)
+    sheet_options = ["ทั้งหมด"] + sorted(list(df_stock['Sheet_Name'].dropna().unique()))
+    selected_sheet = st.selectbox("📂 หมวดสารเคมี (Sheet):", sheet_options)
+
 with f2:
-    search_kw = st.text_input("ค้นหารหัสสารเคมี / ชื่อสารเคมี:", placeholder="เช่น T11-, BO-7790...")
+    # กรองตามสถานที่จัดเก็บ
+    loc_options = ["ทั้งหมด"] + sorted(list(df_stock['Storage location'].dropna().unique()))
+    selected_loc = st.selectbox("📍 สถานที่จัดเก็บ (Location):", loc_options)
+
 with f3:
-    po_search = st.text_input("ค้นหาเลขที่ PO:", placeholder="เช่น 6700195641...")
+    search_kw = st.text_input("🔍 ค้นหารหัส / ชื่อสารเคมี:", placeholder="เช่น T11-, BO-7790...")
+
+with f4:
+    po_search = st.text_input("🧾 ค้นหาเลขที่ PO:", placeholder="เช่น 6700195641...")
 
 # ---------------------------------------------------------
 # รูปแบบที่ 1: รายการรับเข้าทั้งหมด (All Transactions)
@@ -272,6 +266,8 @@ with f3:
 if "1. แสดงประวัติการรับเข้าทุกรายการ" in view_mode:
     filtered_df = merged_all.copy()
     
+    if selected_sheet != "ทั้งหมด" and 'Sheet_Name' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['Sheet_Name'] == selected_sheet]
     if selected_loc != "ทั้งหมด" and 'Storage location' in filtered_df.columns:
         filtered_df = filtered_df[filtered_df['Storage location'] == selected_loc]
     if search_kw:
@@ -282,9 +278,8 @@ if "1. แสดงประวัติการรับเข้าทุก�
     if po_search:
         filtered_df = filtered_df[filtered_df['PO_Number'].str.contains(po_search, na=False)]
 
-    # จัดเตรียมคอลัมน์แสดงผล
     display_cols = [
-        'Material Num', 'Material Desc', 'Storage location', 'Unrestricted', 'Unit',
+        'Material Num', 'Material Desc', 'Sheet_Name', 'Storage location', 'Unrestricted', 'Unit',
         'รอบที่รับ', date_col, 'PO_Number', 'GR_Qty', 'Mat_Document', 'Batch', 'Vendor'
     ]
     actual_cols = [c for c in display_cols if c in filtered_df.columns]
@@ -296,8 +291,9 @@ if "1. แสดงประวัติการรับเข้าทุก�
     show_df.rename(columns={
         'Material Num': 'รหัสสารเคมี',
         'Material Desc': 'ชื่อสารเคมี',
+        'Sheet_Name': 'หมวด/ชีต',
         'Storage location': 'สถานที่จัดเก็บ',
-        'Unrestricted': 'สต๊อกคงเหลือปัจจุบัน',
+        'Unrestricted': 'สต๊อกปัจจุบัน',
         'Unit': 'หน่วย',
         'รอบที่รับ': 'รอบที่รับ',
         date_col: 'วันที่รับเข้า',
@@ -305,13 +301,13 @@ if "1. แสดงประวัติการรับเข้าทุก�
         'GR_Qty': 'จำนวนที่รับเข้า',
         'Mat_Document': 'เลขที่เอกสารรับ (Mat Doc)',
         'Batch': 'ล็อต (Batch)',
-        'Vendor': 'รหัสผู้ขาย (Vendor)'
+        'Vendor': 'รหัสผู้ขาย'
     }, inplace=True)
 
-    st.markdown(f"**แสดงผลทั้งหมด: `{len(show_df):,}` รายการรับเข้า** (เรียงลำดับจากวันที่รับล่าสุดไปหาเก่าสุด)")
+    unique_chem_count = filtered_df['Material Num'].nunique()
+    st.markdown(f"**จำนวนสารเคมี: `{unique_chem_count}` รายการ | พบประวัติการรับเข้าทั้งหมด: `{len(show_df):,}` ครั้ง**")
     st.dataframe(show_df, use_container_width=True, height=520)
 
-    # ปุ่มดาวน์โหลด Excel
     excel_data = convert_df_to_excel(show_df)
     st.download_button(
         label="📥 ดาวน์โหลดประวัติการรับเข้าทั้งหมดเป็น Excel",
@@ -321,11 +317,13 @@ if "1. แสดงประวัติการรับเข้าทุก�
     )
 
 # ---------------------------------------------------------
-# รูปแบบที่ 2: สรุปใน 1 แถวต่อสารเคมี (Grouped All Receipts in One Row)
+# รูปแบบที่ 2: สรุปใน 1 แถวต่อสารเคมี (Grouped View)
 # ---------------------------------------------------------
 else:
     filtered_grouped = df_grouped_view.copy()
     
+    if selected_sheet != "ทั้งหมด" and 'Sheet_Name' in filtered_grouped.columns:
+        filtered_grouped = filtered_grouped[filtered_grouped['Sheet_Name'] == selected_sheet]
     if selected_loc != "ทั้งหมด" and 'Storage location' in filtered_grouped.columns:
         filtered_grouped = filtered_grouped[filtered_grouped['Storage location'] == selected_loc]
     if search_kw:
@@ -337,13 +335,14 @@ else:
         filtered_grouped = filtered_grouped[filtered_grouped['ประวัติการรับเข้าทั้งหมด'].str.contains(po_search, na=False)]
 
     disp_grouped = filtered_grouped[[
-        'Material Num', 'Material Desc', 'Storage location', 'Unit', 
+        'Material Num', 'Material Desc', 'Sheet_Name', 'Storage location', 'Unit', 
         'Unrestricted', 'Total_GR_Qty', 'Receipt_Count', 'ประวัติการรับเข้าทั้งหมด'
     ]].copy()
     
     disp_grouped.rename(columns={
         'Material Num': 'รหัสสารเคมี',
         'Material Desc': 'ชื่อสารเคมี',
+        'Sheet_Name': 'หมวด/ชีต',
         'Storage location': 'สถานที่จัดเก็บ',
         'Unit': 'หน่วย',
         'Unrestricted': 'สต๊อกปัจจุบัน',
